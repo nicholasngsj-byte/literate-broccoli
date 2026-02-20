@@ -618,6 +618,36 @@ int OnInit()
    Print("Entry / Expiry : NY ", InpEntryTime, " / ", InpExpirationTime,
          "  →  Server ", g_svr_entry, " / ", g_svr_expiry);
 
+   // Validate that the converted server times are logically ordered.
+   // Cross-midnight expiry (e.g. NY 19:00 + UTC+7 = server 02:00) makes
+   // IsTimeAfterOrEqual(expiry) permanently true during normal hours, silently
+   // blocking all order placement.
+   int hh_mon, mm_mon, hh_entry, mm_entry, hh_expiry, mm_expiry;
+   ParseHHMM(g_svr_mon_start, hh_mon,    mm_mon);
+   ParseHHMM(g_svr_entry,     hh_entry,  mm_entry);
+   ParseHHMM(g_svr_expiry,    hh_expiry, mm_expiry);
+   int min_mon    = hh_mon    * 60 + mm_mon;
+   int min_entry  = hh_entry  * 60 + mm_entry;
+   int min_expiry = hh_expiry * 60 + mm_expiry;
+
+   if(min_mon >= min_entry)
+   {
+      Print("CONFIG ERROR: Monitoring start (server ", g_svr_mon_start,
+            ") must be BEFORE entry time (server ", g_svr_entry, ").");
+      Print("  Check: are you entering times in NY time, not server time?");
+      Print("  Recommended NY times: Monitor 07:00, Entry 09:00, Expiry 13:00");
+      return INIT_FAILED;
+   }
+   if(min_expiry <= min_entry)
+   {
+      Print("CONFIG ERROR: Expiry server time (", g_svr_expiry,
+            ") is not after entry server time (", g_svr_entry, ").");
+      Print("  The NY→server conversion has crossed midnight.");
+      Print("  You may have entered old server times into the NY time fields.");
+      Print("  Recommended NY times: Monitor 07:00, Entry 09:00, Expiry 13:00");
+      return INIT_FAILED;
+   }
+
    g_day_key = iTime(_Symbol, PERIOD_D1, 0);
    LoadState();
 
