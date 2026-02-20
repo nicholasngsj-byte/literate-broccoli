@@ -15,8 +15,8 @@
 //|   - ADX minimum raised to 25                                     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.2"
-#property description "Prop US Index EA v5.2: US100/US500/US30 – auto-spread + live diagnostic panel"
+#property version   "5.3"
+#property description "Prop US Index EA v5.3: US100/US500/US30 – auto-spread + live diagnostic panel"
 
 //============================================================
 //  INPUTS – Risk / Prop Controls
@@ -61,7 +61,8 @@ input bool   UseSessionFilter      = true;
 input int    SessionStartHour      = 14;     // 14:00 server ~ NY open (UTC+2 broker)
 input int    SessionEndHour        = 20;     // stop new entries at 20:00
 input int    ForceCloseHour        = 20;     // force-close all positions at 20:00 server
-input bool   AvoidFridayClose      = true;   // no new entries Friday
+input bool   AvoidFridayClose      = true;   // no new entries after FridayStopHour on Friday
+input int    FridayStopHour        = 19;     // stop Friday entries at this hour (server); 0 = block all Friday
 
 //============================================================
 //  INPUTS – Trend (H4 + H1 confirmation)
@@ -277,7 +278,7 @@ bool InSession()
    if(!UseSessionFilter) return true;
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.day_of_week == 0 || dt.day_of_week == 6) return false;
-   if(AvoidFridayClose && dt.day_of_week == 5)     return false;
+   if(AvoidFridayClose && dt.day_of_week == 5 && dt.hour >= FridayStopHour) return false;
    return (dt.hour >= SessionStartHour && dt.hour < SessionEndHour);
 }
 
@@ -857,7 +858,7 @@ void UpdateComment()
    string lastFail = StringFormat("Last gate fail: %s", g_lastGateFail);
 
    Comment(
-      "═══ US Index Prop EA v5.2 [", _Symbol, "] ═══\n",
+      "═══ US Index Prop EA v5.3 [", _Symbol, "] ═══\n",
       "Time (server): ", timeStr, "\n",
       "\n",
       spreadLine, "\n",
@@ -1006,7 +1007,7 @@ int OnInit()
 
    EventSetTimer(5);   // refresh diagnostic comment every 5 seconds
 
-   Print("US Index Prop EA v5.2 [", _Symbol, "] initialized. Balance=", g_initBalance,
+   Print("US Index Prop EA v5.3 [", _Symbol, "] initialized. Balance=", g_initBalance,
          " | AutoSpread=", UseAutoSpread, " SpreadAtrRatio=", SpreadAtrRatio,
          " | Session=", SessionStartHour, "-", SessionEndHour);
 
