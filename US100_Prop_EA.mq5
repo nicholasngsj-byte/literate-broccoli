@@ -15,8 +15,8 @@
 //|   - ADX minimum raised to 25                                     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.1"
-#property description "Prop US100 EA v5.1: auto-spread + live diagnostic panel"
+#property version   "5.2"
+#property description "Prop US Index EA v5.2: US100/US500/US30 – auto-spread + live diagnostic panel"
 
 //============================================================
 //  INPUTS – Risk / Prop Controls
@@ -34,15 +34,20 @@ input int    ConsecLossHalt        = 2;       // halt day after N consecutive lo
 //============================================================
 //  INPUTS – Execution
 //============================================================
-input int    MaxSpreadPoints       = 350;    // absolute hard cap (pts); raise if broker widens at open
+// MaxSpreadPoints hard cap – set per instrument:
+//   US100 : ~150-200 pts live → set 300-400
+//   US500 : ~50-100 pts live  → set 150-200   ← recommended for US500
+//   US30  : ~150-250 pts live → set 300-400
+input int    MaxSpreadPoints       = 200;    // default tuned for US500; change for other symbols
 input int    SlippagePoints        = 50;
 // Fill: 0=FOK, 1=IOC, 2=RETURN
 input int    FillPolicy            = 2;      // ORDER_FILLING_RETURN (most CFD-compatible)
 
 // Auto-spread: dynamic limit = SpreadAtrRatio × ATR_H1
 // Trades only fire when spread < min(MaxSpreadPoints, ATR_H1 × SpreadAtrRatio)
+// SpreadAtrRatio is instrument-agnostic – ATR auto-scales with price
 input bool   UseAutoSpread         = true;
-input double SpreadAtrRatio        = 0.25;   // spread must be < 25% of ATR_H1 (auto-scales with volatility)
+input double SpreadAtrRatio        = 0.20;   // spread must be < 20% of ATR_H1
 
 //============================================================
 //  INPUTS – Diagnostics
@@ -566,14 +571,16 @@ bool PlaceOrder(bool bullish, double sl, double tp, double lots)
    if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED)
    { Print("OrderSend retcode: ", res.retcode); return false; }
 
-   // res.position = position ticket of the resulting position (correct for MT5 market orders)
+   // In MT5, the position ticket == the opening order ticket (res.order).
+   // res.position was added in a later build and is not available in all MT5 versions.
+   // res.order is safe across all MT5 builds and matches what PositionGetTicket() returns.
    int sz = ArraySize(g_partials);
    ArrayResize(g_partials, sz + 1);
-   g_partials[sz].ticket      = res.position;   // FIX: position ticket, not deal ticket
+   g_partials[sz].ticket      = res.order;   // opening order ticket == position ticket
    g_partials[sz].partialDone = false;
    g_partials[sz].beDone      = false;
 
-   Print("Order placed: pos=", res.position, " deal=", res.deal,
+   Print("Order placed: order=", res.order, " deal=", res.deal,
          " lots=", lots, " sl=", sl, " tp=", tp);
    return true;
 }
@@ -850,7 +857,7 @@ void UpdateComment()
    string lastFail = StringFormat("Last gate fail: %s", g_lastGateFail);
 
    Comment(
-      "═══ US100 Prop EA v5.1 ═══\n",
+      "═══ US Index Prop EA v5.2 [", _Symbol, "] ═══\n",
       "Time (server): ", timeStr, "\n",
       "\n",
       spreadLine, "\n",
@@ -999,7 +1006,7 @@ int OnInit()
 
    EventSetTimer(5);   // refresh diagnostic comment every 5 seconds
 
-   Print("US100 Prop EA v5.1 initialized. Balance=", g_initBalance,
+   Print("US Index Prop EA v5.2 [", _Symbol, "] initialized. Balance=", g_initBalance,
          " | AutoSpread=", UseAutoSpread, " SpreadAtrRatio=", SpreadAtrRatio,
          " | Session=", SessionStartHour, "-", SessionEndHour);
 
