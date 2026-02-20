@@ -15,8 +15,8 @@
 //|   - ADX minimum raised to 25                                     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.0"
-#property description "Prop US100 EA v5.0: dual-TF trend + RSI + EOD close + ATR SL cap"
+#property version   "5.1"
+#property description "Prop US100 EA v5.1: auto-spread + live diagnostic panel"
 
 //============================================================
 //  INPUTS – Risk / Prop Controls
@@ -34,10 +34,20 @@ input int    ConsecLossHalt        = 2;       // halt day after N consecutive lo
 //============================================================
 //  INPUTS – Execution
 //============================================================
-input int    MaxSpreadPoints       = 250;    // US100 spread ~150-200 pts
+input int    MaxSpreadPoints       = 350;    // absolute hard cap (pts); raise if broker widens at open
 input int    SlippagePoints        = 50;
 // Fill: 0=FOK, 1=IOC, 2=RETURN
 input int    FillPolicy            = 2;      // ORDER_FILLING_RETURN (most CFD-compatible)
+
+// Auto-spread: dynamic limit = SpreadAtrRatio × ATR_H1
+// Trades only fire when spread < min(MaxSpreadPoints, ATR_H1 × SpreadAtrRatio)
+input bool   UseAutoSpread         = true;
+input double SpreadAtrRatio        = 0.25;   // spread must be < 25% of ATR_H1 (auto-scales with volatility)
+
+//============================================================
+//  INPUTS – Diagnostics
+//============================================================
+input bool   ShowDiagnostics      = true;   // show gate status panel on chart
 
 //============================================================
 //  INPUTS – Session / EOD
@@ -131,6 +141,7 @@ int      g_tradesToday       = 0;
 int      g_consecLosses      = 0;
 bool     g_haltedToday       = false;
 bool     g_eodClosedToday    = false;   // so we only force-close once per day
+string   g_lastGateFail      = "—";    // diagnostic: last reason entry was blocked
 
 struct PartialInfo {
    ulong ticket;       // position ticket (POSITION_IDENTIFIER)
@@ -279,6 +290,32 @@ int CurrentSpreadPoints()
    long spr = 0;
    if(!SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spr)) return 999999;
    return (int)spr;
+}
+
+// Returns the effective max spread allowed right now (in points).
+// If UseAutoSpread: limit = SpreadAtrRatio * ATR_H1 (auto-scales with volatility).
+// Always capped by MaxSpreadPoints as a hard ceiling.
+int DynamicMaxSpread()
+{
+   int hardCap = MaxSpreadPoints;
+   if(!UseAutoSpread || g_h1ATRHandle == INVALID_HANDLE) return hardCap;
+
+   double atrVal = 0;
+   if(!GetBuf(g_h1ATRHandle, 1, atrVal) || atrVal <= 0) return hardCap;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point <= 0) return hardCap;
+
+   int atrPts      = (int)(atrVal / point);
+   int dynamicCap  = (int)(atrPts * SpreadAtrRatio);
+
+   // Return the lower of the two limits (never exceed hard cap)
+   return MathMin(hardCap, MathMax(dynamicCap, 20));  // floor at 20 pts so filter never goes to 0
+}
+
+bool SpreadOK()
+{
+   return (CurrentSpreadPoints() <= DynamicMaxSpread());
 }
 
 //------------------------------------------------------------
@@ -716,18 +753,157 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //------------------------------------------------------------
+//  Diagnostic panel (chart Comment)
+//------------------------------------------------------------
+void UpdateComment()
+{
+   if(!ShowDiagnostics) return;
+
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   string timeStr = StringFormat("%04d-%02d-%02d %02d:%02d:%02d",
+                                 dt.year, dt.mon, dt.day,
+                                 dt.hour, dt.min, dt.sec);
+
+   // Spread
+   int spr     = CurrentSpreadPoints();
+   int sprMax  = DynamicMaxSpread();
+   string sprStatus = (spr <= sprMax) ? "PASS" : "FAIL";
+   string sprMode   = UseAutoSpread ? StringFormat("auto(ATR×%.2f)", SpreadAtrRatio) : "fixed";
+   string spreadLine = StringFormat("Spread: %d pts | Limit: %d pts [%s] (%s)",
+                                    spr, sprMax, sprStatus, sprMode);
+
+   // Session
+   string sessStatus = InSession() ? "OPEN" : "CLOSED";
+   bool eod = IsEOD();
+   string sessLine = StringFormat("Session: %s [%02d:00–%02d:00] | EOD close: %s",
+                                  sessStatus, SessionStartHour, SessionEndHour,
+                                  eod ? "YES" : "no");
+
+   // Trend
+   double h4fast=0, h4slow=0, h1s1=0, h1s3=0;
+   bool h4ok = GetBuf(g_h4FastHandle,1,h4fast) && GetBuf(g_h4SlowHandle,1,h4slow);
+   bool h1ok = GetBuf(g_h1SlowHandle,1,h1s1) && GetBuf(g_h1SlowHandle,3,h1s3);
+   string h4dir = !h4ok ? "?" : (h4fast > h4slow ? "BULL" : "BEAR");
+   string h1dir = !h1ok ? "?" : (h1s1  > h1s3    ? "BULL" : "BEAR");
+   int trend = GetTrend();
+   string trendOK = (trend != 0) ? "PASS" : "FAIL";
+   string trendLine = StringFormat("H4 trend: %s | H1 slope: %s | Combined: [%s]",
+                                   h4dir, h1dir, trendOK);
+
+   // ADX
+   string adxLine = "ADX: n/a";
+   if(UseADXFilter && g_h1ADXHandle != INVALID_HANDLE)
+   {
+      double adx = 0;
+      if(GetBuf(g_h1ADXHandle, 1, adx))
+         adxLine = StringFormat("ADX(H1): %.1f | Min: %.0f [%s]",
+                                adx, ADX_MinLevel, adx >= ADX_MinLevel ? "PASS" : "FAIL");
+   }
+
+   // RSI
+   string rsiLine = "RSI: n/a";
+   if(UseRSIFilter && g_h1RSIHandle != INVALID_HANDLE)
+   {
+      double rsi = 0;
+      if(GetBuf(g_h1RSIHandle, 1, rsi))
+      {
+         bool rsiPass = (trend > 0) ? (rsi >= RSI_BuyMin  && rsi <= RSI_BuyMax)
+                                    : (rsi >= RSI_SellMin && rsi <= RSI_SellMax);
+         rsiLine = StringFormat("RSI(H1): %.1f | Range[%.0f–%.0f] [%s]",
+                                rsi,
+                                (trend > 0) ? RSI_BuyMin  : RSI_SellMin,
+                                (trend > 0) ? RSI_BuyMax  : RSI_SellMax,
+                                rsiPass ? "PASS" : "FAIL");
+      }
+   }
+
+   // ATR regime
+   string regimeLine = "ATR regime: n/a";
+   if(UseATRRegimeFilter && g_h4ATRHandle != INVALID_HANDLE)
+   {
+      double atrBuf[];
+      ArraySetAsSeries(atrBuf, true);
+      int copied = CopyBuffer(g_h4ATRHandle, 0, 1, ATR_Median_Lookback, atrBuf);
+      if(copied > 0)
+      {
+         double med = Median(atrBuf, copied);
+         regimeLine = StringFormat("ATR regime(H4): %.0f | Median: %.0f | Mult: %.2f [%s]",
+                                   atrBuf[0], med, ATR_RegimeMult,
+                                   PassATRRegimeFilter() ? "PASS" : "FAIL");
+      }
+   }
+
+   // Risk / halt state
+   string haltLine = StringFormat("Halt: %s | Trades today: %d/%d | Consec losses: %d/%d",
+                                  AnyHaltCondition() ? "YES" : "no",
+                                  g_tradesToday, MaxTradesPerDay,
+                                  g_consecLosses, ConsecLossHalt);
+
+   string ddLine = StringFormat("DD daily: %.2f%% / %.1f%% | Total: %.2f%% / %.1f%% | Peak: %.2f%% / %.1f%%",
+                                g_dayStartEquity>0 ? (g_dayStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/g_dayStartEquity*100.0 : 0,
+                                DailyStopPct,
+                                g_initBalance>0 ? (g_initBalance-AccountInfoDouble(ACCOUNT_EQUITY))/g_initBalance*100.0 : 0,
+                                TotalDrawdownPct,
+                                g_equityPeak>0 ? (g_equityPeak-AccountInfoDouble(ACCOUNT_EQUITY))/g_equityPeak*100.0 : 0,
+                                TrailingDDFromPeakPct);
+
+   string lastFail = StringFormat("Last gate fail: %s", g_lastGateFail);
+
+   Comment(
+      "═══ US100 Prop EA v5.1 ═══\n",
+      "Time (server): ", timeStr, "\n",
+      "\n",
+      spreadLine, "\n",
+      sessLine,   "\n",
+      trendLine,  "\n",
+      adxLine,    "\n",
+      rsiLine,    "\n",
+      regimeLine, "\n",
+      "\n",
+      haltLine,   "\n",
+      ddLine,     "\n",
+      "\n",
+      lastFail
+   );
+}
+
+//------------------------------------------------------------
 //  Entry
 //------------------------------------------------------------
 void TryEnter()
 {
    UpdateDailyState();
-   if(AnyHaltCondition())                        return;
-   if(g_tradesToday >= MaxTradesPerDay)           return;
-   if(!InSession())                               return;
-   if(IsEOD())                                    return;
-   if(CurrentSpreadPoints() > MaxSpreadPoints)    return;
-   if(PositionsByMagic() >= MaxConcurrentTrades)  return;
-   if(!PassATRRegimeFilter())                     return;
+
+   // --- Gate checks with tracking ---
+   if(AnyHaltCondition())
+      { g_lastGateFail = "HALT active"; return; }
+
+   if(g_tradesToday >= MaxTradesPerDay)
+      { g_lastGateFail = StringFormat("Max trades/day (%d/%d)", g_tradesToday, MaxTradesPerDay); return; }
+
+   if(!InSession())
+   {
+      MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+      g_lastGateFail = StringFormat("Outside session (server %02d:%02d, window %02d-%02d)",
+                                    dt.hour, dt.min, SessionStartHour, SessionEndHour);
+      return;
+   }
+
+   if(IsEOD())
+      { g_lastGateFail = "EOD – no new entries"; return; }
+
+   if(!SpreadOK())
+   {
+      g_lastGateFail = StringFormat("Spread %d pts > limit %d pts", CurrentSpreadPoints(), DynamicMaxSpread());
+      Print("Gate SPREAD: ", g_lastGateFail);
+      return;
+   }
+
+   if(PositionsByMagic() >= MaxConcurrentTrades)
+      { g_lastGateFail = StringFormat("Max concurrent (%d)", MaxConcurrentTrades); return; }
+
+   if(!PassATRRegimeFilter())
+      { g_lastGateFail = "ATR regime filter"; Print("Gate ATR-REGIME blocked"); return; }
 
    // ADX
    if(UseADXFilter && g_h1ADXHandle != INVALID_HANDLE)
@@ -735,44 +911,61 @@ void TryEnter()
       double adx = 0;
       if(GetBuf(g_h1ADXHandle, 1, adx) && adx < ADX_MinLevel)
       {
-         Print("ADX ", DoubleToString(adx, 1), " < ", ADX_MinLevel, " – skip");
+         g_lastGateFail = StringFormat("ADX %.1f < %.0f", adx, ADX_MinLevel);
+         Print("Gate ADX: ", g_lastGateFail);
          return;
       }
    }
 
    int trend = GetTrend();
-   if(trend == 0) return;
+   if(trend == 0)
+      { g_lastGateFail = "No trend (H4+H1 disagree or not persistent)"; Print("Gate TREND: ", g_lastGateFail); return; }
    bool bullish = (trend > 0);
 
-   if(!PullbackOK(bullish))     return;
-   if(!PassRSIFilter(bullish))  return;
+   if(!PullbackOK(bullish))
+      { g_lastGateFail = StringFormat("No pullback to EMA%d (%s)", H1_EMA_Pullback, bullish?"bull":"bear"); Print("Gate PULLBACK: ", g_lastGateFail); return; }
+
+   if(!PassRSIFilter(bullish))
+   {
+      double rsi = 0; GetBuf(g_h1RSIHandle, 1, rsi);
+      g_lastGateFail = StringFormat("RSI %.1f out of range", rsi);
+      Print("Gate RSI: ", g_lastGateFail);
+      return;
+   }
 
    double sl = 0;
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double entry = bullish ? ask : bid;
 
-   if(!FindSwingSL(bullish, entry, sl)) return;
+   if(!FindSwingSL(bullish, entry, sl))
+      { g_lastGateFail = "FindSwingSL: not enough H1 bars"; return; }
 
-   if(bullish  && sl >= entry) return;
-   if(!bullish && sl <= entry) return;
+   if((bullish && sl >= entry) || (!bullish && sl <= entry))
+      { g_lastGateFail = "SL wrong side of entry"; return; }
 
    // Minimum SL distance guard
    double slDist = MathAbs(entry - sl);
    double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(slDist < MinSL_Points * point)
    {
-      Print("SL too tight: ", slDist / point, " pts – skip");
+      g_lastGateFail = StringFormat("SL too tight: %.0f pts < %d pts min", slDist/point, MinSL_Points);
+      Print("Gate SL-MIN: ", g_lastGateFail);
       return;
    }
 
    double tp = bullish ? (entry + RR_TP * slDist) : (entry - RR_TP * slDist);
 
    double lots = 0;
-   if(!CalcLots(entry, sl, lots)) return;
+   if(!CalcLots(entry, sl, lots))
+      { g_lastGateFail = "CalcLots failed (check tick value/size)"; return; }
 
    if(PlaceOrder(bullish, sl, tp, lots))
+   {
       g_tradesToday++;
+      g_lastGateFail = StringFormat("TRADE PLACED (%s) sl=%.1f tp=%.1f lots=%.2f",
+                                    bullish ? "BUY" : "SELL", sl, tp, lots);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -804,7 +997,16 @@ int OnInit()
    MqlRates b;
    if(GetH1Bar(0, b)) g_lastH1BarTime = b.time;
 
-   Print("US100 Prop EA v5.0 initialized. Balance=", g_initBalance);
+   EventSetTimer(5);   // refresh diagnostic comment every 5 seconds
+
+   Print("US100 Prop EA v5.1 initialized. Balance=", g_initBalance,
+         " | AutoSpread=", UseAutoSpread, " SpreadAtrRatio=", SpreadAtrRatio,
+         " | Session=", SessionStartHour, "-", SessionEndHour);
+
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   Print("Server time at init: ", StringFormat("%02d:%02d:%02d day_of_week=%d",
+         dt.hour, dt.min, dt.sec, dt.day_of_week));
+
    return INIT_SUCCEEDED;
 }
 
@@ -813,11 +1015,22 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
+   Comment("");   // clear chart panel on removal
+
    int handles[] = { g_h4FastHandle, g_h4SlowHandle, g_h1SlowHandle,
                      g_h1EMAHandle,  g_h1ADXHandle,  g_h1RSIHandle,
                      g_h1ATRHandle,  g_h4ATRHandle };
    for(int i = 0; i < ArraySize(handles); i++)
       if(handles[i] != INVALID_HANDLE) IndicatorRelease(handles[i]);
+}
+
+//+------------------------------------------------------------------+
+//| Timer – refreshes diagnostic comment every 5 s                  |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   UpdateComment();
 }
 
 //+------------------------------------------------------------------+
