@@ -11,9 +11,9 @@
 //|  3. Difference = your offset  (e.g. server 17:00, UTC 15:00     |
 //|     → offset is +2)                                             |
 //|                                                                  |
-//|  DST NOTE: NY uses EDT (UTC-4) from 2nd Sunday March to         |
-//|  1st Sunday November, and EST (UTC-5) the rest of the year.     |
-//|  Toggle InpNYSummerTime when NY clocks change.                  |
+//|  DST NOTE: NY DST is auto-detected. EDT (UTC-4) applies from    |
+//|  2nd Sunday March to 1st Sunday November. No manual toggle      |
+//|  needed — the EA adjusts its window automatically each day.     |
 //|                                                                  |
 //|  PIP DEFINITION FOR XAUUSD:                                      |
 //|  1 pip = $1.00 price move (e.g. 2345.00 → 2346.00).            |
@@ -25,7 +25,6 @@
 
 input group "=== TIMEZONE ==="
 input int    InpBrokerUTCOffset = 2;     // Broker UTC offset (e.g. 2 = UTC+2). See instructions above.
-input bool   InpNYSummerTime    = false; // true = NY on EDT (UTC-4, mid-Mar→early-Nov), false = EST (UTC-5)
 
 input group "=== STRATEGY SETTINGS  [all times in NY time] ==="
 input string   InpMonitoringStart    = "07:00";   // Range build start  (NY time)
@@ -39,7 +38,8 @@ input group "=== RISK MANAGEMENT ==="
 input double   InpLotSize            = 0.0;        // Fixed lot (0 = auto risk-based)
 input double   InpRiskPercent        = 1.0;        // Total risk % per setup (split if both sides)
 input double   InpStopLossPips       = 40.0;       // SL distance in pips (1 pip = $1.00 for XAUUSD)
-input double   InpTakeProfitPips     = 80.0;       // TP distance in pips
+input double   InpTakeProfitPips     = 0.0;        // Fixed TP in pips (0 = use range multiplier below)
+input double   InpTPRangeMultiplier  = 2.0;        // TP = range_height × this (when InpTakeProfitPips = 0)
 input double   InpMaxLots            = 5.0;        // Hard lot cap per order (0 = no cap)
 
 input bool     InpUseTrailing        = true;
@@ -115,6 +115,35 @@ void LoadState()
 }
 
 //---------------- Timezone conversion ----------------
+// Returns true when t falls inside US EDT (2nd Sunday of March → 1st Sunday of November).
+bool IsNYSummerTime(datetime t)
+{
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   int y = dt.year;
+
+   // 2nd Sunday of March at 02:00
+   MqlDateTime tmp;
+   ZeroMemory(tmp);
+   tmp.year = y; tmp.mon = 3; tmp.day = 1; tmp.hour = 2;
+   datetime mar1 = StructToTime(tmp);
+   MqlDateTime m1;
+   TimeToStruct(mar1, m1);
+   int to_first_sun_mar = (m1.day_of_week == 0) ? 0 : (7 - m1.day_of_week);
+   datetime edt_start = mar1 + (datetime)((to_first_sun_mar + 7) * 86400);
+
+   // 1st Sunday of November at 02:00
+   ZeroMemory(tmp);
+   tmp.year = y; tmp.mon = 11; tmp.day = 1; tmp.hour = 2;
+   datetime nov1 = StructToTime(tmp);
+   MqlDateTime n1;
+   TimeToStruct(nov1, n1);
+   int to_first_sun_nov = (n1.day_of_week == 0) ? 0 : (7 - n1.day_of_week);
+   datetime edt_end = nov1 + (datetime)(to_first_sun_nov * 86400);
+
+   return (t >= edt_start && t < edt_end);
+}
+
 // Convert a NY time string "HH:MM" to a broker server time string "HH:MM".
 // NY EST = UTC-5, NY EDT = UTC-4.
 // Handles midnight wrap in both directions.
@@ -126,8 +155,8 @@ string NYToServer(const string nyHHMM)
    hh = (int)StringToInteger(StringSubstr(nyHHMM, 0, colon));
    mm = (int)StringToInteger(StringSubstr(nyHHMM, colon + 1));
 
-   int ny_utc = InpNYSummerTime ? -4 : -5;           // NY UTC offset
-   int shift   = (InpBrokerUTCOffset - ny_utc) * 60;  // minutes to add
+   int ny_utc = IsNYSummerTime(TimeCurrent()) ? -4 : -5; // NY UTC offset (auto-detected)
+   int shift   = (InpBrokerUTCOffset - ny_utc) * 60;    // minutes to add
 
    int total = hh * 60 + mm + shift;
    total = ((total % 1440) + 1440) % 1440;            // wrap into 0-1439
@@ -138,8 +167,8 @@ string NYToServer(const string nyHHMM)
 // Convenience: returns current NY time as "HH:MM" for debug display.
 string CurrentNYTime()
 {
-   int ny_utc  = InpNYSummerTime ? -4 : -5;
-   int shift   = (ny_utc - InpBrokerUTCOffset) * 60;  // subtract offset to go from server→NY
+   int ny_utc  = IsNYSummerTime(TimeCurrent()) ? -4 : -5; // auto-detected
+   int shift   = (ny_utc - InpBrokerUTCOffset) * 60;     // subtract offset to go from server→NY
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int total = dt.hour * 60 + dt.min + shift;
@@ -270,7 +299,7 @@ void ResetDailyProtector()
    g_daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_killswitch          = false;
    g_orders_placed_today = false;
-   // g_consec_losses NOT reset — persists across days intentionally
+   g_consec_losses       = 0;   // reset daily — day limit, not permanent halt
    SaveState();
 }
 
@@ -429,6 +458,9 @@ bool PlaceBreakoutOrders()
    if(!BuildRange(hi, lo)) return false;
 
    double pip    = PipSize();
+   double tp_pips = InpTakeProfitPips > 0.0
+                    ? InpTakeProfitPips
+                    : ((hi - lo) / pip) * InpTPRangeMultiplier;
    double offset = InpOffsetPips * pip;
 
    double buyPrice  = hi + offset;
@@ -448,10 +480,10 @@ bool PlaceBreakoutOrders()
 
    if(lotBuy <= 0 && lotSell <= 0) return false;
 
-   double slBuy  = NormalizeDouble(buyPrice  - (InpStopLossPips   * pip), _Digits);
-   double tpBuy  = NormalizeDouble(buyPrice  + (InpTakeProfitPips * pip), _Digits);
-   double slSell = NormalizeDouble(sellPrice + (InpStopLossPips   * pip), _Digits);
-   double tpSell = NormalizeDouble(sellPrice - (InpTakeProfitPips * pip), _Digits);
+   double slBuy  = NormalizeDouble(buyPrice  - (InpStopLossPips * pip), _Digits);
+   double tpBuy  = NormalizeDouble(buyPrice  + (tp_pips         * pip), _Digits);
+   double slSell = NormalizeDouble(sellPrice + (InpStopLossPips * pip), _Digits);
+   double tpSell = NormalizeDouble(sellPrice - (tp_pips         * pip), _Digits);
 
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippagePoints);
@@ -481,6 +513,7 @@ bool PlaceBreakoutOrders()
    if(ok1 || ok2)
    {
       Print("Orders placed. Range Hi=", hi, " Lo=", lo,
+            " RangeH=", DoubleToString((hi-lo)/pip,1), "pip  TP=", DoubleToString(tp_pips,1), "pip",
             " BuyStop=", buyPrice, " SellStop=", sellPrice,
             " Expiry(server)=", TimeToString(expiry));
       g_orders_placed_today = true;
@@ -596,6 +629,19 @@ void DebugPrintMinute()
          " FreeMargin=", AccountInfoDouble(ACCOUNT_FREEMARGIN));
 }
 
+//---------------- Server-time refresh (must be called at OnInit and each new day) ----------------
+void RefreshServerTimes()
+{
+   g_svr_mon_start = NYToServer(InpMonitoringStart);
+   g_svr_mon_end   = NYToServer(InpMonitoringEnd);
+   g_svr_entry     = NYToServer(InpEntryTime);
+   g_svr_expiry    = NYToServer(InpExpirationTime);
+
+   string zone = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
+   Print("NY zone: auto (", zone, ")  Monitor: Server ", g_svr_mon_start, "-", g_svr_mon_end,
+         "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry);
+}
+
 //---------------- Events ----------------
 int OnInit()
 {
@@ -604,19 +650,10 @@ int OnInit()
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippagePoints);
 
-   // Convert NY input times → server time strings once at startup
-   g_svr_mon_start = NYToServer(InpMonitoringStart);
-   g_svr_mon_end   = NYToServer(InpMonitoringEnd);
-   g_svr_entry     = NYToServer(InpEntryTime);
-   g_svr_expiry    = NYToServer(InpExpirationTime);
+   RefreshServerTimes();
 
-   string zone = InpNYSummerTime ? "EDT (UTC-4)" : "EST (UTC-5)";
    Print("=== NY Breakout EA initialised ===");
-   Print("Broker UTC offset: +", InpBrokerUTCOffset, "  NY zone: ", zone);
-   Print("Monitor window : NY ", InpMonitoringStart, "-", InpMonitoringEnd,
-         "  →  Server ", g_svr_mon_start, "-", g_svr_mon_end);
-   Print("Entry / Expiry : NY ", InpEntryTime, " / ", InpExpirationTime,
-         "  →  Server ", g_svr_entry, " / ", g_svr_expiry);
+   Print("Broker UTC offset: +", InpBrokerUTCOffset);
 
    // Validate that the converted server times are logically ordered.
    // Cross-midnight expiry (e.g. NY 19:00 + UTC+7 = server 02:00) makes
@@ -662,7 +699,10 @@ void OnTick()
    if(dt.day_of_week == 0 || dt.day_of_week == 6) return;
 
    if(IsNewDay())
+   {
+      RefreshServerTimes();   // DST may have changed overnight
       ResetDailyProtector();
+   }
 
    CheckEquityProtector();
 
