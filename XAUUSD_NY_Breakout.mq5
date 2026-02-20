@@ -372,22 +372,40 @@ bool BuildRange(double &hi, double &lo)
    hi = -DBL_MAX;
    lo =  DBL_MAX;
 
+   ENUM_TIMEFRAMES tf = MapTFMins(InpRangeTFMins);
    datetime tStart = TodayAt(g_svr_mon_start);
-   datetime tEnd   = TodayAt(g_svr_entry) - 1;  // 1 sec before entry = all bars fully closed
+   datetime tEnd   = TodayAt(g_svr_entry) - 1;  // 1 sec before entry = only fully closed bars
 
    if(tStart == 0 || tEnd == 0 || tEnd <= tStart) return false;
 
-   ENUM_TIMEFRAMES tf = MapTFMins(InpRangeTFMins);
+   // Use bar-shift lookup + position-based CopyRates.
+   // The datetime-range overload of CopyRates can silently return 0 bars
+   // inside the MT5 Strategy Tester even when the data exists; the
+   // position-based overload is reliable in both live and backtesting.
+   int sh_start = iBarShift(_Symbol, tf, tStart, false); // older  → higher shift
+   int sh_end   = iBarShift(_Symbol, tf, tEnd,   false); // newer  → lower  shift
+
+   if(sh_start < 0 || sh_end < 0)
+   {
+      Print("BuildRange: iBarShift failed. tStart=", TimeToString(tStart),
+            " tEnd=", TimeToString(tEnd));
+      return false;
+   }
+
+   // Guard against unexpected reversal
+   if(sh_start < sh_end) { int t = sh_start; sh_start = sh_end; sh_end = t; }
+
+   int count = sh_start - sh_end + 1;
+   if(count <= 0) return false;
 
    MqlRates rates[];
-   ArraySetAsSeries(rates, false);   // chronological order for the from/to overload
-
-   int copied = CopyRates(_Symbol, tf, tStart, tEnd, rates);
+   ArraySetAsSeries(rates, false);
+   // start_pos = sh_end (most-recent bar in our window); copies count bars back in time
+   int copied = CopyRates(_Symbol, tf, sh_end, count, rates);
    if(copied <= 0)
    {
-      if(InpDebugPrint)
-         Print("BuildRange: no bars returned. tStart=", TimeToString(tStart),
-               " tEnd=", TimeToString(tEnd), " TF=", EnumToString(tf));
+      Print("BuildRange: CopyRates returned 0. sh_start=", sh_start,
+            " sh_end=", sh_end, " count=", count, " TF=", EnumToString(tf));
       return false;
    }
 
@@ -608,6 +626,11 @@ int OnInit()
 
 void OnTick()
 {
+   // Skip Saturday (6) and Sunday (0) — no NY session, no point checking windows
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   if(dt.day_of_week == 0 || dt.day_of_week == 6) return;
+
    if(IsNewDay())
       ResetDailyProtector();
 
