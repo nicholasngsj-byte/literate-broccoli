@@ -54,8 +54,9 @@ input int    InpATRPeriod         = 14;
 input double InpATR_SL_Mult       = 1.5;   // SL = entry ± ATR × mult
 input double InpRR                = 1.8;   // TP = SL distance × RR
 // Volatility gate (XAU points – tune per broker)
-input double InpMinATR_Points     = 100.0;
-input double InpMaxATR_Points     = 650.0;
+// NOTE: value = atr / _Point. For 3-decimal brokers (_Point=0.001) multiply by 10.
+input double InpMinATR_Points     = 80.0;
+input double InpMaxATR_Points     = 2500.0;
 
 input group "=== TREND STRENGTH (ADX) ==="
 input int    InpADXPeriod         = 14;
@@ -91,9 +92,10 @@ input bool InpUseTimeStop         = true;
 input int  InpMaxMinutesInTrade   = 240;    // Exit flat/losing trade after N minutes
 
 input group "=== EXECUTION ==="
-input int  InpMaxSpreadPoints     = 100;
+input int  InpMaxSpreadPoints     = 250;   // Live XAUUSD spread is typically 150-300 pts
 input int  InpSlippagePoints      = 30;
 input bool InpNewBarOnly          = true;
+input bool InpDebugPrint          = true;  // Print filter status to Experts tab every 60s
 
 //====================================================================
 //  INDICATOR HANDLES
@@ -566,6 +568,27 @@ void OnDeinit(const int reason)
 //====================================================================
 void OnTick()
 {
+   //--- Diagnostics: print filter status to Experts tab once per minute
+   if(InpDebugPrint)
+   {
+      static datetime _lastPrint = 0;
+      if(TimeCurrent() - _lastPrint >= 60)
+      {
+         _lastPrint = TimeCurrent();
+         double _a = 0, _d = 0, _r = 0;
+         Copy1(hATR, 0, 1, _a);
+         Copy1(hADX, 0, 1, _d);
+         Copy1(hRSI, 0, 1, _r);
+         PrintFormat("[DIAG] Spread=%d | ATR_pts=%.1f | ADX=%.2f | RSI=%.2f | HaltDay=%s | HaltTotal=%s | HaltTrail=%s | Trades=%d/%d | Session=%s",
+            SpreadPoints(), (_Point > 0 ? _a / _Point : 0), _d, _r,
+            g_haltDay  ? "Y" : "N",
+            g_haltTotal? "Y" : "N",
+            g_haltTrail? "Y" : "N",
+            g_tradesToday, InpMaxTradesPerDay,
+            InSession() ? "Y" : "N");
+      }
+   }
+
    //--- FTMO safety first
    if(CheckHardDD())
    {
