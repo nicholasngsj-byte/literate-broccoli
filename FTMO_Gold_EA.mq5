@@ -1,12 +1,19 @@
 //+------------------------------------------------------------------+
-//|  FTMO Gold EA v2.0 – Multi-TF Trend + Quality Gates             |
+//|  FTMO Gold EA v2.1 – Multi-TF Trend + Quality Gates             |
 //|  Symbol : XAUUSD (Gold)   Timeframe : M15                       |
 //|  Strategy: H4 trend bias → M15 EMA alignment → RSI momentum     |
 //|            ATR-based SL/TP, partial close at 1R, ATR trail      |
+//|  v2.1 changes (Jan-26 optimisation):                            |
+//|   - Fix: H4 EMA now reads shift=1 (closed candle, not forming)  |
+//|   - RSI band widened to 72/28 to allow strong-trend entries     |
+//|   - ATR SL mult raised 1.5→1.8 for higher Jan-26 volatility     |
+//|   - ATR trail mult raised 1.2→1.5; BE start raised 0.7→0.8R    |
+//|   - ADX floor lowered 20→18; body filter relaxed 35%→30%        |
+//|   - Time stop extended 240→360 min; full-stack toggle added     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.00"
-#property description "FTMO Gold EA v2 | H4+M15 Multi-TF | Partial Close | Session Filter"
+#property version   "2.10"
+#property description "FTMO Gold EA v2.1 | H4+M15 Multi-TF | Jan-26 Tuned | Partial Close | Session Filter"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -46,12 +53,12 @@ input int InpTrendEMA             = 200;   // Structural bias on entry TF
 
 input group "=== RSI MOMENTUM FILTER ==="
 input int    InpRSIPeriod         = 14;
-input double InpRSI_BuyMax        = 68.0;  // Block long entries above this
-input double InpRSI_SellMin       = 32.0;  // Block short entries below this
+input double InpRSI_BuyMax        = 72.0;  // Block long entries above this  (was 68 – raised to allow strong-trend entries)
+input double InpRSI_SellMin       = 28.0;  // Block short entries below this (was 32 – lowered to match)
 
 input group "=== ATR / SL / TP ==="
 input int    InpATRPeriod         = 14;
-input double InpATR_SL_Mult       = 1.5;   // SL = entry ± ATR × mult
+input double InpATR_SL_Mult       = 1.8;   // SL = entry ± ATR × mult  (was 1.5 – wider stops for Jan-26 volatility)
 input double InpRR                = 1.8;   // TP = SL distance × RR
 // Volatility gate (XAU points – tune per broker)
 // NOTE: value = atr / _Point. For 3-decimal brokers (_Point=0.001) multiply by 10.
@@ -60,16 +67,21 @@ input double InpMaxATR_Points     = 2500.0;
 
 input group "=== TREND STRENGTH (ADX) ==="
 input int    InpADXPeriod         = 14;
-input double InpADXMin            = 20.0;
+input double InpADXMin            = 18.0;  // (was 20 – slightly relaxed to reduce over-filtering in Jan-26)
 
 input group "=== CANDLE BODY FILTER ==="
 input bool   InpBodyFilter        = true;   // Require directional candle
-input double InpBodyMinPct        = 0.35;   // Min body / total range ratio
+input double InpBodyMinPct        = 0.30;   // Min body / total range ratio  (was 0.35 – relaxed for high-wick Jan-26 candles)
 
 input group "=== SESSION FILTER (Server Time) ==="
 input bool InpUseSessionFilter    = true;
 input int  InpSessionStartHour    = 7;      // 07:00 – London open
 input int  InpSessionEndHour      = 21;     // 21:00 – NY close
+
+input group "=== ENTRY FILTERS ==="
+// Full-stack: requires slow EMA > trend EMA (55 > 200) for entry.
+// Set false to allow earlier entries – price above trend EMA is sufficient.
+input bool   InpRequireFullStack  = false;  // false = relaxed M15 stack (catches earlier trend entries)
 
 input group "=== TRADE MANAGEMENT ==="
 // Partial close
@@ -79,17 +91,17 @@ input double InpPartialPct        = 50.0;   // % of position to close
 
 // Break-even
 input bool   InpUseBreakEven      = true;
-input double InpBE_StartR         = 0.7;    // Move SL to BE when trade reaches this R
+input double InpBE_StartR         = 0.8;    // Move SL to BE when trade reaches this R  (was 0.7 – later trigger prevents early BE whipsaw)
 input double InpBE_OffsetPoints   = 15.0;   // Lock tiny profit (points beyond entry)
 
 // ATR trailing stop
 input bool   InpUseATRTrail       = true;
-input double InpTrailATRMult      = 1.2;
+input double InpTrailATRMult      = 1.5;    // (was 1.2 – wider trail gives winning trades more room)
 input double InpTrailStartR       = 1.0;    // Begin trailing at 1R
 
 // Time stop
 input bool InpUseTimeStop         = true;
-input int  InpMaxMinutesInTrade   = 240;    // Exit flat/losing trade after N minutes
+input int  InpMaxMinutesInTrade   = 360;    // Exit flat/losing trade after N minutes  (was 240 – gold trends can take longer)
 
 input group "=== EXECUTION ==="
 input int  InpMaxSpreadPoints     = 250;   // Live XAUUSD spread is typically 150-300 pts
@@ -613,10 +625,11 @@ void OnTick()
 
    //=== INDICATORS (use last closed candle → shift 1 on entry TF) ===
 
-   // H4 trend EMAs
+   // H4 trend EMAs – use shift=1 (last *closed* H4 candle) so bias is stable
+   // (shift=0 reads the still-forming candle whose EMA value changes every tick)
    double htfFast, htfSlow;
-   if(!Copy1(hHTF_Fast, 0, 0, htfFast)) return;
-   if(!Copy1(hHTF_Slow, 0, 0, htfSlow)) return;
+   if(!Copy1(hHTF_Fast, 0, 1, htfFast)) return;
+   if(!Copy1(hHTF_Slow, 0, 1, htfSlow)) return;
 
    // M15 EMAs
    double fast, slow, trend;
@@ -646,10 +659,11 @@ void OnTick()
    //=== ENTRY LOGIC ===
    //
    // LONG conditions:
-   //   1. H4 bullish:  htfFast > htfSlow
-   //   2. M15 aligned: bid > fast > slow > trend  (full stack alignment)
-   //   3. RSI not overbought: rsi < InpRSI_BuyMax
-   //   4. Bullish confirmation candle (body ≥ 35% of range)
+   //   1. H4 bullish (closed candle): htfFast > htfSlow
+   //   2. M15 aligned: InpRequireFullStack=true  → bid > fast > slow > trend
+   //                   InpRequireFullStack=false → bid > fast > slow  AND  bid > trend
+   //   3. RSI not overbought: rsi < InpRSI_BuyMax  (72 – allows strong-trend entries)
+   //   4. Bullish confirmation candle (body ≥ 30% of range)
    //
    // SHORT conditions: mirror image
    //
@@ -657,8 +671,15 @@ void OnTick()
    bool h4Bull = (htfFast > htfSlow);
    bool h4Bear = (htfFast < htfSlow);
 
-   bool m15Bull = (bid > fast && fast > slow && slow > trend);
-   bool m15Bear = (bid < fast && fast < slow && slow < trend);
+   // Full-stack: bid > fast > slow > trend  (strict – requires 55 EMA above 200 EMA)
+   // Relaxed:   bid > fast > slow  AND  bid > trend  (price confirms structural bias;
+   //            allows earlier entries before the 55 crosses the 200)
+   bool m15Bull = InpRequireFullStack
+                  ? (bid > fast && fast > slow && slow > trend)
+                  : (bid > fast && fast > slow && bid > trend);
+   bool m15Bear = InpRequireFullStack
+                  ? (bid < fast && fast < slow && slow < trend)
+                  : (bid < fast && fast < slow && bid < trend);
 
    if(h4Bull && m15Bull && rsi < InpRSI_BuyMax  && BullishBody())
       ExecuteTrade(ORDER_TYPE_BUY,  atr);
