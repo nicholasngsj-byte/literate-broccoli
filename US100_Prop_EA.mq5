@@ -15,8 +15,8 @@
 //|   - ADX minimum raised to 25                                     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.3"
-#property description "Prop US Index EA v5.3: US100/US500/US30 – auto-spread + live diagnostic panel"
+#property version   "5.4"
+#property description "Prop US Index EA v5.4: US100/US500/US30 – auto-spread + live diagnostic panel"
 
 //============================================================
 //  INPUTS – Risk / Prop Controls
@@ -76,7 +76,8 @@ input int    H1_EMA_Slow           = 50;     // H1 trend slope confirmation
 //  INPUTS – Entry
 //============================================================
 input int    H1_EMA_Pullback       = 20;
-input int    EMA_Touch_Buffer_Pts  = 80;     // bar within N pts of EMA = pullback
+input int    EMA_Touch_Buffer_Pts  = 100;    // bar within N pts of EMA = pullback (was 80)
+input int    PullbackLookbackBars  = 3;      // scan last N H1 bars for EMA touch
 input double DisplaceBodyMinPct    = 0.55;   // body/range >= this for signal candle
 
 // RSI filter
@@ -120,8 +121,8 @@ input double ATRTrail_Mult         = 1.50;   // trail at 1.5×ATR_H1 (after BE)
 //============================================================
 input bool   UseATRRegimeFilter    = true;
 input int    ATR_Period            = 14;
-input int    ATR_Median_Lookback   = 1500;
-input double ATR_RegimeMult        = 0.85;
+input int    ATR_Median_Lookback   = 800;    // ~3.5 months of H4 bars (was 1500/1yr)
+input double ATR_RegimeMult        = 0.75;   // block only extreme low-vol (was 0.85)
 
 //============================================================
 //  Indicator handles
@@ -448,13 +449,22 @@ bool PullbackOK(bool bullish)
    double ema = 0;
    if(!GetBuf(g_h1EMAHandle, 1, ema)) return false;
 
-   MqlRates sig;
-   if(!GetH1Bar(1, sig)) return false;
-
    double buffer = EMA_Touch_Buffer_Pts * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   bool touched = (sig.low <= ema + buffer && sig.high >= ema - buffer);
+   // Phase 1: did price touch EMA within the last PullbackLookbackBars H1 bars?
+   bool touched = false;
+   for(int i = 1; i <= PullbackLookbackBars; i++)
+   {
+      MqlRates bar;
+      if(!GetH1Bar(i, bar)) continue;
+      if(bar.low <= ema + buffer && bar.high >= ema - buffer)
+         { touched = true; break; }
+   }
    if(!touched) return false;
+
+   // Phase 2: bar[1] must be a strong displacement candle closing on the right side
+   MqlRates sig;
+   if(!GetH1Bar(1, sig)) return false;
 
    if(bullish  && sig.close < ema - buffer) return false;
    if(!bullish && sig.close > ema + buffer) return false;
@@ -858,7 +868,7 @@ void UpdateComment()
    string lastFail = StringFormat("Last gate fail: %s", g_lastGateFail);
 
    Comment(
-      "═══ US Index Prop EA v5.3 [", _Symbol, "] ═══\n",
+      "═══ US Index Prop EA v5.4 [", _Symbol, "] ═══\n",
       "Time (server): ", timeStr, "\n",
       "\n",
       spreadLine, "\n",
@@ -1007,7 +1017,7 @@ int OnInit()
 
    EventSetTimer(5);   // refresh diagnostic comment every 5 seconds
 
-   Print("US Index Prop EA v5.3 [", _Symbol, "] initialized. Balance=", g_initBalance,
+   Print("US Index Prop EA v5.4 [", _Symbol, "] initialized. Balance=", g_initBalance,
          " | AutoSpread=", UseAutoSpread, " SpreadAtrRatio=", SpreadAtrRatio,
          " | Session=", SessionStartHour, "-", SessionEndHour);
 
