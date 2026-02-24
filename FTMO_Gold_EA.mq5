@@ -46,8 +46,11 @@ input int InpTrendEMA             = 200;   // Structural bias on entry TF
 
 input group "=== RSI MOMENTUM FILTER ==="
 input int    InpRSIPeriod         = 14;
-input double InpRSI_BuyMax        = 68.0;  // Block long entries above this
-input double InpRSI_SellMin       = 32.0;  // Block short entries below this
+// In a strong trend (full EMA stack aligned) RSI naturally sits 60-80 for bulls,
+// 20-40 for bears.  The old defaults of 68/32 blocked the majority of valid setups.
+// 75/25 keeps the extreme-overextension guard without fighting the trend filter.
+input double InpRSI_BuyMax        = 75.0;  // Block long entries above this
+input double InpRSI_SellMin       = 25.0;  // Block short entries below this
 
 input group "=== ATR / SL / TP ==="
 input int    InpATRPeriod         = 14;
@@ -599,11 +602,11 @@ void OnTick()
    //--- Spread gate
    if(SpreadPoints() > InpMaxSpreadPoints) return;
 
-   //--- New-bar gate
-   if(InpNewBarOnly && !IsNewBar()) return;
-
-   //--- Manage any open position (trailing, BE, partial close, time stop)
+   //--- Manage any open position every tick (trailing, BE, partial close, time stop)
    ManageOpenPosition();
+
+   //--- New-bar gate: entry logic only needs to run once per bar
+   if(InpNewBarOnly && !IsNewBar()) return;
 
    //--- Only look for new entry when flat
    if(AnyOurPosition()) return;
@@ -613,12 +616,12 @@ void OnTick()
 
    //=== INDICATORS (use last closed candle → shift 1 on entry TF) ===
 
-   // H4 trend EMAs
+   // H4 trend EMAs (shift=1 = last closed H4 bar – avoids repainting on forming bar)
    double htfFast, htfSlow;
-   if(!Copy1(hHTF_Fast, 0, 0, htfFast)) return;
-   if(!Copy1(hHTF_Slow, 0, 0, htfSlow)) return;
+   if(!Copy1(hHTF_Fast, 0, 1, htfFast)) return;
+   if(!Copy1(hHTF_Slow, 0, 1, htfSlow)) return;
 
-   // M15 EMAs
+   // M15 EMAs (shift=1 = last closed M15 bar)
    double fast, slow, trend;
    if(!Copy1(hFast,  0, 1, fast))  return;
    if(!Copy1(hSlow,  0, 1, slow))  return;
@@ -630,6 +633,10 @@ void OnTick()
    if(!Copy1(hADX, 0, 1, adx)) return;   // buffer 0 = ADX line
    if(!Copy1(hRSI, 0, 1, rsi)) return;
 
+   // Last closed M15 candle close – compare against shift=1 EMAs (same bar)
+   double closeM15 = iClose(_Symbol, InpTF, 1);
+   if(closeM15 <= 0.0) return;
+
    //=== QUALITY GATES ===
 
    // Volatility gate
@@ -639,16 +646,12 @@ void OnTick()
    // Trend strength gate
    if(adx < InpADXMin) return;
 
-   // Current bid for direction check
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(bid <= 0.0) return;
-
    //=== ENTRY LOGIC ===
    //
    // LONG conditions:
-   //   1. H4 bullish:  htfFast > htfSlow
-   //   2. M15 aligned: bid > fast > slow > trend  (full stack alignment)
-   //   3. RSI not overbought: rsi < InpRSI_BuyMax
+   //   1. H4 bullish:  htfFast > htfSlow  (last closed H4 bar)
+   //   2. M15 aligned: close[1] > fast > slow > trend  (full stack, closed bar)
+   //   3. RSI not overextended: rsi < InpRSI_BuyMax
    //   4. Bullish confirmation candle (body ≥ 35% of range)
    //
    // SHORT conditions: mirror image
@@ -657,8 +660,24 @@ void OnTick()
    bool h4Bull = (htfFast > htfSlow);
    bool h4Bear = (htfFast < htfSlow);
 
-   bool m15Bull = (bid > fast && fast > slow && slow > trend);
-   bool m15Bear = (bid < fast && fast < slow && slow < trend);
+   bool m15Bull = (closeM15 > fast && fast > slow && slow > trend);
+   bool m15Bear = (closeM15 < fast && fast < slow && slow < trend);
+
+   if(InpDebugPrint)
+   {
+      static datetime _lastEntryPrint = 0;
+      if(TimeCurrent() - _lastEntryPrint >= 60)
+      {
+         _lastEntryPrint = TimeCurrent();
+         PrintFormat("[ENTRY] H4Bull=%s H4Bear=%s M15Bull=%s M15Bear=%s RSI=%.2f(<%s/>%s) ADX=%.2f Body1=Bull%s/Bear%s closeM15=%.5f fast=%.5f slow=%.5f trend=%.5f",
+            h4Bull?"Y":"N", h4Bear?"Y":"N",
+            m15Bull?"Y":"N", m15Bear?"Y":"N",
+            rsi, DoubleToString(InpRSI_BuyMax,1), DoubleToString(InpRSI_SellMin,1),
+            adx,
+            BullishBody()?"Y":"N", BearishBody()?"Y":"N",
+            closeM15, fast, slow, trend);
+      }
+   }
 
    if(h4Bull && m15Bull && rsi < InpRSI_BuyMax  && BullishBody())
       ExecuteTrade(ORDER_TYPE_BUY,  atr);
