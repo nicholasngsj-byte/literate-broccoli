@@ -31,6 +31,8 @@ input string   InpMonitoringStart    = "07:00";   // Range build start  (NY time
 input string   InpMonitoringEnd      = "08:59";   // Range build end    (NY time)
 input string   InpEntryTime          = "09:00";   // Earliest order placement (NY time, typically NY open)
 input string   InpExpirationTime     = "13:00";   // Cancel pendings + stop trading (NY time)
+input bool     InpUseHardClose       = true;       // Force-close open positions at SGT cutoff
+input string   InpHardCloseTimeSGT   = "01:00";   // Hard close time (Singapore Time UTC+8). 01:00 SGT = 17:00 UTC.
 input double   InpOffsetPips         = 5.0;        // Offset above/below range for stop entry
 input int      InpRangeTFMins        = 15;         // Timeframe for range bars (1/5/15/30/60)
 
@@ -38,13 +40,13 @@ input group "=== RISK MANAGEMENT ==="
 input double   InpLotSize            = 0.0;        // Fixed lot (0 = auto risk-based)
 input double   InpRiskPercent        = 1.0;        // Total risk % per setup (split if both sides)
 input double   InpStopLossPips       = 40.0;       // SL distance in pips (1 pip = $1.00 for XAUUSD)
-input double   InpTakeProfitPips     = 0.0;        // Fixed TP in pips (0 = use range multiplier below)
+input double   InpTakeProfitPips     = 80.0;       // Fixed TP in pips (0 = use range multiplier below)
 input double   InpTPRangeMultiplier  = 2.0;        // TP = range_height × this (when InpTakeProfitPips = 0)
 input double   InpMaxLots            = 5.0;        // Hard lot cap per order (0 = no cap)
 
 input bool     InpUseTrailing        = true;
-input double   InpTrailStartPips     = 30.0;       // Profit in pips before trailing starts
-input double   InpTrailStepPips      = 10.0;       // Trail distance behind current price
+input double   InpTrailStartPips     = 40.0;       // Profit in pips before trailing starts
+input double   InpTrailStepPips      = 25.0;       // Trail distance behind current price
 
 input group "=== PROP FIRM PROTECTION ==="
 input double   InpMaxDailyLossPct    = 3.5;        // Daily loss limit % of start balance (keep < 5% for FTMO)
@@ -68,6 +70,7 @@ string   g_svr_mon_start  = "";
 string   g_svr_mon_end    = "";
 string   g_svr_entry      = "";
 string   g_svr_expiry     = "";
+string   g_svr_hard_close = "";   // computed from InpHardCloseTimeSGT
 
 double   g_daily_start_balance = 0.0;
 datetime g_day_key             = 0;
@@ -160,6 +163,23 @@ string NYToServer(const string nyHHMM)
 
    int total = hh * 60 + mm + shift;
    total = ((total % 1440) + 1440) % 1440;            // wrap into 0-1439
+
+   return StringFormat("%02d:%02d", total / 60, total % 60);
+}
+
+// Convert a SGT time "HH:MM" (UTC+8) to broker server time "HH:MM".
+// DST-independent: SGT is fixed UTC+8 year-round.
+string SGTToServer(const string sgtHHMM)
+{
+   int hh, mm;
+   int colon = StringFind(sgtHHMM, ":");
+   if(colon <= 0) return sgtHHMM;
+   hh = (int)StringToInteger(StringSubstr(sgtHHMM, 0, colon));
+   mm = (int)StringToInteger(StringSubstr(sgtHHMM, colon + 1));
+
+   int shift = (InpBrokerUTCOffset - 8) * 60;   // SGT = UTC+8
+   int total = hh * 60 + mm + shift;
+   total = ((total % 1440) + 1440) % 1440;
 
    return StringFormat("%02d:%02d", total / 60, total % 60);
 }
@@ -632,14 +652,16 @@ void DebugPrintMinute()
 //---------------- Server-time refresh (must be called at OnInit and each new day) ----------------
 void RefreshServerTimes()
 {
-   g_svr_mon_start = NYToServer(InpMonitoringStart);
-   g_svr_mon_end   = NYToServer(InpMonitoringEnd);
-   g_svr_entry     = NYToServer(InpEntryTime);
-   g_svr_expiry    = NYToServer(InpExpirationTime);
+   g_svr_mon_start  = NYToServer(InpMonitoringStart);
+   g_svr_mon_end    = NYToServer(InpMonitoringEnd);
+   g_svr_entry      = NYToServer(InpEntryTime);
+   g_svr_expiry     = NYToServer(InpExpirationTime);
+   g_svr_hard_close = InpUseHardClose ? SGTToServer(InpHardCloseTimeSGT) : "";
 
    string zone = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
    Print("NY zone: auto (", zone, ")  Monitor: Server ", g_svr_mon_start, "-", g_svr_mon_end,
-         "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry);
+         "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry,
+         "  HardClose(server): ", (g_svr_hard_close != "" ? g_svr_hard_close : "off"));
 }
 
 //---------------- Events ----------------
@@ -705,6 +727,20 @@ void OnTick()
    }
 
    CheckEquityProtector();
+
+   // Hard SGT close — DST-independent cutoff (e.g. 01:00 SGT = 19:00 server for UTC+2).
+   // Fires regardless of killswitch state to guarantee position is flat by the configured time.
+   if(g_svr_hard_close != "" && IsTimeAfterOrEqual(g_svr_hard_close))
+   {
+      if(HasActivePosition())
+      {
+         Print("HARD CLOSE: SGT cutoff (server ", g_svr_hard_close, ") — force-closing all positions.");
+         CloseAllPositions();
+      }
+      if(HasPendingOrders()) DeleteAllPendings();
+      if(!g_killswitch) { g_killswitch = true; SaveState(); }
+      return;
+   }
 
    if(g_killswitch)
    {
