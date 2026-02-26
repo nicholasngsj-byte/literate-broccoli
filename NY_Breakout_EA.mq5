@@ -809,11 +809,13 @@ void RefreshServerTimes()
    g_svr_hard_close = InpUseHardClose ? SGTToServer(InpHardCloseTimeSGT) : "";
    g_svr_ny_close   = (InpNYSessionClose != "") ? NYToServer(InpNYSessionClose) : "";
 
-   string zone = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
+   string zone      = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
+   string hc_str    = g_svr_hard_close != "" ? g_svr_hard_close : "off";
+   string nyc_str   = g_svr_ny_close   != "" ? g_svr_ny_close   : "off";
    Print("NY zone: auto (", zone, ")  Monitor: Server ", g_svr_mon_start, "-", g_svr_mon_end,
          "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry,
-         "  HardClose(server): ", (g_svr_hard_close != "" ? g_svr_hard_close : "off"),
-         "  NYClose(server): ",   (g_svr_ny_close   != "" ? g_svr_ny_close   : "off"));
+         "  HardClose(server): ", hc_str,
+         "  NYClose(server): ",   nyc_str);
 }
 
 //---------------- Events ----------------
