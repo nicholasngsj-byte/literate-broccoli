@@ -82,6 +82,13 @@ input ulong    InpMagic              = 123456;
 input int      InpSlippagePoints     = 20;
 input bool     InpDebugPrint         = false;
 
+input group "=== BREAK-EVEN STOP ==="
+input double   InpBreakEvenPips      = 20.0;       // Move SL to entry+buffer when profit reaches this many pips (0 = disabled)
+input double   InpBreakEvenBuffer    = 3.0;         // Extra pips beyond entry for the BE SL (absorbs spread on exit)
+
+input group "=== SESSION CLOSE ==="
+input string   InpNYSessionClose     = "17:00";    // Close all positions at this NY time — e.g. "17:00" = 5 pm NY (end of session). "" = off
+
 CTrade      trade;
 CSymbolInfo sym;
 
@@ -92,6 +99,7 @@ string   g_svr_mon_end    = "";
 string   g_svr_entry      = "";
 string   g_svr_expiry     = "";
 string   g_svr_hard_close = "";   // computed from InpHardCloseTimeSGT
+string   g_svr_ny_close   = "";   // computed from InpNYSessionClose
 
 double   g_daily_start_balance = 0.0;
 datetime g_day_key             = 0;
@@ -678,6 +686,61 @@ void ApplyTrailing()
    }
 }
 
+//---------------- Break-even stop ----------------
+// Called on every tick. Once a position's floating profit crosses InpBreakEvenPips,
+// the SL is moved to entry price + InpBreakEvenBuffer pips.  This guarantees that a
+// position that "goes green" can never turn into a full SL loss — worst case it exits
+// at a small gain (buffer) covering the spread.  The trailing stop then takes over
+// and tightens from there.
+void ApplyBreakEven()
+{
+   if(InpBreakEvenPips <= 0.0) return;
+
+   double pip = PipSize();
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong pt = PositionGetTicket(i);
+      if(pt == 0 || !PositionSelectByTicket(pt)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      long   type = PositionGetInteger(POSITION_TYPE);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl   = PositionGetDouble(POSITION_SL);
+      double tp   = PositionGetDouble(POSITION_TP);
+      double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         double profit_pips = (bid - open) / pip;
+         if(profit_pips < InpBreakEvenPips) continue;
+
+         double beSL = NormalizeDouble(open + (InpBreakEvenBuffer * pip), _Digits);
+         if(sl >= beSL) continue;   // already at or above BE level — do nothing
+
+         if(InpDebugPrint)
+            PrintFormat("BREAK-EVEN BUY: profit=%.1f pip  SL %.5f → %.5f (entry + %.0f pip buffer)",
+                        profit_pips, sl, beSL, InpBreakEvenBuffer);
+         trade.PositionModify(pt, beSL, tp);
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         double profit_pips = (open - ask) / pip;
+         if(profit_pips < InpBreakEvenPips) continue;
+
+         double beSL = NormalizeDouble(open - (InpBreakEvenBuffer * pip), _Digits);
+         if(sl != 0.0 && sl <= beSL) continue;   // already at or below BE level — do nothing
+
+         if(InpDebugPrint)
+            PrintFormat("BREAK-EVEN SELL: profit=%.1f pip  SL %.5f → %.5f (entry - %.0f pip buffer)",
+                        profit_pips, sl, beSL, InpBreakEvenBuffer);
+         trade.PositionModify(pt, beSL, tp);
+      }
+   }
+}
+
 //---------------- Consecutive loss tracking ----------------
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest     &request,
@@ -744,11 +807,13 @@ void RefreshServerTimes()
    g_svr_entry      = NYToServer(InpEntryTime);
    g_svr_expiry     = NYToServer(InpExpirationTime);
    g_svr_hard_close = InpUseHardClose ? SGTToServer(InpHardCloseTimeSGT) : "";
+   g_svr_ny_close   = (InpNYSessionClose != "") ? NYToServer(InpNYSessionClose) : "";
 
    string zone = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
    Print("NY zone: auto (", zone, ")  Monitor: Server ", g_svr_mon_start, "-", g_svr_mon_end,
          "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry,
-         "  HardClose(server): ", (g_svr_hard_close != "" ? g_svr_hard_close : "off"));
+         "  HardClose(server): ", (g_svr_hard_close != "" ? g_svr_hard_close : "off"),
+         "  NYClose(server): ",   (g_svr_ny_close   != "" ? g_svr_ny_close   : "off"));
 }
 
 //---------------- Events ----------------
@@ -765,6 +830,12 @@ int OnInit()
    Print("Broker UTC offset: +", InpBrokerUTCOffset);
    Print("News filter: ", (InpUseNewsFilter ? "ON" : "OFF"),
          " | Before=", InpNewsMinsBefore, "min | After=", InpNewsMinsAfter, "min");
+   Print("Break-even: ", (InpBreakEvenPips > 0.0
+         ? StringFormat("%.0f pip profit → SL to entry + %.0f pip buffer", InpBreakEvenPips, InpBreakEvenBuffer)
+         : "OFF"));
+   Print("NY session close: ", (g_svr_ny_close != ""
+         ? "server " + g_svr_ny_close + "  (NY " + InpNYSessionClose + ")"
+         : "OFF"));
 
    // Validate that the converted server times are logically ordered.
    // Cross-midnight expiry (e.g. NY 19:00 + UTC+7 = server 02:00) makes
@@ -841,11 +912,27 @@ void OnTick()
    if(IsTimeAfterOrEqual(g_svr_expiry))
       DeleteAllPendings();
 
+   // NY session close — exit all positions at end of the NY trading session.
+   // Uses DST-aware NY time (via NYToServer) so it auto-adjusts for EDT/EST.
+   // This prevents positions from drifting into the quiet Asian session where
+   // the original SL would otherwise be hit on a random overnight reversal.
+   if(g_svr_ny_close != "" && IsTimeAfterOrEqual(g_svr_ny_close))
+   {
+      if(HasActivePosition())
+      {
+         Print("NY SESSION CLOSE (server ", g_svr_ny_close, "): closing all positions.");
+         CloseAllPositions();
+      }
+      if(HasPendingOrders()) DeleteAllPendings();
+      return;   // skip order placement — expiry has passed anyway
+   }
+
    if(!g_orders_placed_today && IsTimeAfterOrEqual(g_svr_entry))
       PlaceBreakoutOrders();
 
    CancelOppositeAfterFill();
 
-   ApplyTrailing();
+   ApplyBreakEven();   // lock in trade at entry once profit threshold reached
+   ApplyTrailing();    // trail SL once trade is well in profit
    DebugPrintMinute();
 }
