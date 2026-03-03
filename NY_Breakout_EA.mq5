@@ -591,6 +591,22 @@ bool PlaceBreakoutOrders()
    double lotBuy  = CalcLotByRiskAndMargin(InpStopLossPips, ORDER_TYPE_BUY_STOP,  buyPrice);
    double lotSell = CalcLotByRiskAndMargin(InpStopLossPips, ORDER_TYPE_SELL_STOP, sellPrice);
 
+   // Skip any side where price already blew past the stop level.
+   // A BuyStop triggered by a retrace (not a fresh breakout) goes against momentum
+   // and nearly always hits SL — skip it entirely.
+   if(ask >= buyPrice)
+   {
+      if(InpDebugPrint)
+         PrintFormat("SKIP BuyStop: ask %.5f already >= buyPrice %.5f (breakout already occurred)", ask, buyPrice);
+      lotBuy = 0.0;
+   }
+   if(bid <= sellPrice)
+   {
+      if(InpDebugPrint)
+         PrintFormat("SKIP SellStop: bid %.5f already <= sellPrice %.5f (breakout already occurred)", bid, sellPrice);
+      lotSell = 0.0;
+   }
+
    if(lotBuy <= 0 && lotSell <= 0) return false;
 
    double slBuy  = NormalizeDouble(buyPrice  - (InpStopLossPips * pip), _Digits);
