@@ -98,8 +98,9 @@ string   g_svr_mon_start  = "";
 string   g_svr_mon_end    = "";
 string   g_svr_entry      = "";
 string   g_svr_expiry     = "";
-string   g_svr_hard_close = "";   // computed from InpHardCloseTimeSGT
-string   g_svr_ny_close   = "";   // computed from InpNYSessionClose
+string   g_svr_hard_close    = "";   // computed from InpHardCloseTimeSGT
+string   g_svr_ny_close      = "";   // computed from InpNYSessionClose
+bool     g_ny_close_next_day = false; // true when NY close converts to a next-day server time
 
 double   g_daily_start_balance = 0.0;
 datetime g_day_key             = 0;
@@ -473,7 +474,7 @@ double CalcLotByRiskAndMargin(double sl_pips, ENUM_ORDER_TYPE orderType, double 
 
    double lots_risk = NormalizeLot(risk_money / loss_per_lot);
 
-   double freeMargin       = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double freeMargin       = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    double maxMarginAllowed = freeMargin * (InpMaxMarginUsePct / 100.0);
 
    double margin_per_lot = 0.0;
@@ -796,7 +797,7 @@ void DebugPrintMinute()
          " NewsBlock=",  (newsBlock             ? "YES" : "NO"),
          " ConsecLoss=", g_consec_losses,
          " Balance=",    AccountInfoDouble(ACCOUNT_BALANCE),
-         " FreeMargin=", AccountInfoDouble(ACCOUNT_FREEMARGIN));
+         " FreeMargin=", AccountInfoDouble(ACCOUNT_MARGIN_FREE));
 }
 
 //---------------- Server-time refresh (must be called at OnInit and each new day) ----------------
@@ -809,9 +810,23 @@ void RefreshServerTimes()
    g_svr_hard_close = InpUseHardClose ? SGTToServer(InpHardCloseTimeSGT) : "";
    g_svr_ny_close   = (InpNYSessionClose != "") ? NYToServer(InpNYSessionClose) : "";
 
+   // Detect midnight wrap: e.g. 17:00 NY EST + UTC+2 broker = "00:00" server.
+   // IsTimeAfterOrEqual("00:00") is always true, which would block all order
+   // placement.  Flag it so OnTick can skip the check on the same calendar day.
+   if(g_svr_ny_close != "")
+   {
+      int nhh = 0, nmm = 0, ehh = 0, emm = 0;
+      ParseHHMM(g_svr_ny_close, nhh, nmm);
+      ParseHHMM(g_svr_entry,    ehh, emm);
+      g_ny_close_next_day = (nhh * 60 + nmm) <= (ehh * 60 + emm);
+   }
+   else
+      g_ny_close_next_day = false;
+
    string zone      = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
    string hc_str    = g_svr_hard_close != "" ? g_svr_hard_close : "off";
    string nyc_str   = g_svr_ny_close   != "" ? g_svr_ny_close   : "off";
+   if(g_ny_close_next_day) nyc_str = nyc_str + " (+1d)";
    Print("NY zone: auto (", zone, ")  Monitor: Server ", g_svr_mon_start, "-", g_svr_mon_end,
          "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry,
          "  HardClose(server): ", hc_str,
@@ -918,7 +933,7 @@ void OnTick()
    // Uses DST-aware NY time (via NYToServer) so it auto-adjusts for EDT/EST.
    // This prevents positions from drifting into the quiet Asian session where
    // the original SL would otherwise be hit on a random overnight reversal.
-   if(g_svr_ny_close != "" && IsTimeAfterOrEqual(g_svr_ny_close))
+   if(g_svr_ny_close != "" && !g_ny_close_next_day && IsTimeAfterOrEqual(g_svr_ny_close))
    {
       if(HasActivePosition())
       {
