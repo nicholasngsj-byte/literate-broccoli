@@ -77,6 +77,17 @@ input int      InpNewsMinsAfter      = 30;          // Resume this many minutes 
 // TIP: InpNewsMinsBefore=60 + InpNewsMinsAfter=30 means the EA avoids a 90-minute window
 //      centred around each high-impact release.  For NFP or CPI you may want wider gaps.
 
+input group "=== TREND FILTER ==="
+// Before placing orders the EA reads the last completed candle of the monitoring
+// period (on the range timeframe).  If its body-to-range ratio exceeds
+// InpTrendMinBodyPct, the candle has a clear directional bias:
+//   Bullish candle → only BuyStop is placed  (SellStop skipped)
+//   Bearish candle → only SellStop is placed (BuyStop skipped)
+//   Doji / small body → no clear bias → both stops are placed as normal
+// Set InpUseTrendFilter = false to revert to the original both-sides behaviour.
+input bool     InpUseTrendFilter     = true;        // Enable directional bias filter
+input double   InpTrendMinBodyPct    = 0.35;        // Min body/range ratio to count as directional (0.35 = 35%)
+
 input group "=== BREAK-EVEN STOP ==="
 input double   InpBreakEvenPips      = 20.0;       // Move SL to entry+buffer when profit reaches this many pips (0 = disabled)
 input double   InpBreakEvenBuffer    = 3.0;        // Extra pips beyond entry for the BE SL (absorbs spread on exit)
@@ -550,6 +561,41 @@ bool BuildRange(double &hi, double &lo)
    return (hi > lo);
 }
 
+//---------------- Directional bias from last monitoring candle ----------------
+// Returns:
+//  +1 → bullish conviction  → place BuyStop only
+//  -1 → bearish conviction  → place SellStop only
+//   0 → indecision / filter off → place both stops
+//
+// Logic: look at the last fully-closed bar on the range TF that falls inside
+// the monitoring window (just before InpEntryTime).  If the candle's body is
+// at least InpTrendMinBodyPct of its full high-low range it has a clear
+// direction; otherwise it is a doji-like candle and we treat it as neutral.
+int GetRangeBias()
+{
+   if(!InpUseTrendFilter) return 0;
+
+   ENUM_TIMEFRAMES tf = MapTFMins(InpRangeTFMins);
+   datetime tEnd = TodayAt(g_svr_entry) - 1;   // last second of monitoring window
+
+   int sh = iBarShift(_Symbol, tf, tEnd, false);
+   if(sh < 0) return 0;   // iBarShift failed → neutral, place both
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, tf, sh, 1, rates) != 1) return 0;
+
+   double o     = rates[0].open;
+   double c     = rates[0].close;
+   double range = rates[0].high - rates[0].low;
+   if(range <= 0.0) return 0;
+
+   double bodyPct = MathAbs(c - o) / range;
+   if(bodyPct < InpTrendMinBodyPct) return 0;   // indecision candle → both stops
+
+   return (c > o) ? 1 : -1;
+}
+
 //---------------- Order placement ----------------
 bool PlaceBreakoutOrders()
 {
@@ -569,6 +615,16 @@ bool PlaceBreakoutOrders()
    double hi, lo;
    if(!BuildRange(hi, lo)) return false;
 
+   // ---- Directional bias filter ------------------------------------------
+   // +1 = bullish last candle → BuyStop only
+   // -1 = bearish last candle → SellStop only
+   //  0 = doji / filter off   → both stops
+   int bias = GetRangeBias();
+   if(InpDebugPrint)
+      Print("Trend bias: ", (bias > 0 ? "BULLISH (BuyStop only)" :
+                             bias < 0 ? "BEARISH (SellStop only)" : "NEUTRAL (both stops)"));
+   // -----------------------------------------------------------------------
+
    double pip    = PipSize();
    double tp_pips = InpTakeProfitPips > 0.0
                     ? InpTakeProfitPips
@@ -587,8 +643,9 @@ bool PlaceBreakoutOrders()
    if((buyPrice  - ask) < minDist) buyPrice  = ask + minDist;
    if((bid - sellPrice) < minDist) sellPrice = bid - minDist;
 
-   double lotBuy  = CalcLotByRiskAndMargin(InpStopLossPips, ORDER_TYPE_BUY_STOP,  buyPrice);
-   double lotSell = CalcLotByRiskAndMargin(InpStopLossPips, ORDER_TYPE_SELL_STOP, sellPrice);
+   // Gate each side on bias: skip the side that contradicts the candle direction
+   double lotBuy  = (bias >= 0) ? CalcLotByRiskAndMargin(InpStopLossPips, ORDER_TYPE_BUY_STOP,  buyPrice)  : 0.0;
+   double lotSell = (bias <= 0) ? CalcLotByRiskAndMargin(InpStopLossPips, ORDER_TYPE_SELL_STOP, sellPrice) : 0.0;
 
    if(lotBuy <= 0 && lotSell <= 0) return false;
 
@@ -624,7 +681,8 @@ bool PlaceBreakoutOrders()
 
    if(ok1 || ok2)
    {
-      Print("Orders placed. Range Hi=", hi, " Lo=", lo,
+      Print("Orders placed. Bias=", (bias > 0 ? "BUY-ONLY" : bias < 0 ? "SELL-ONLY" : "BOTH"),
+            " Range Hi=", hi, " Lo=", lo,
             " RangeH=", DoubleToString((hi-lo)/pip,1), "pip  TP=", DoubleToString(tp_pips,1), "pip",
             " BuyStop=", buyPrice, " SellStop=", sellPrice,
             " Expiry(server)=", TimeToString(expiry));
