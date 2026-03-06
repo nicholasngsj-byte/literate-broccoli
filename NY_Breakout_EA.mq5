@@ -127,8 +127,12 @@ string   g_svr_mon_start  = "";
 string   g_svr_mon_end    = "";
 string   g_svr_entry      = "";
 string   g_svr_expiry     = "";
-string   g_svr_hard_close = "";   // computed from InpHardCloseTimeSGT
-string   g_svr_ny_close   = "";   // computed from InpNYSessionClose
+string   g_svr_hard_close    = "";     // computed from InpHardCloseTimeSGT
+string   g_svr_ny_close      = "";     // computed from InpNYSessionClose
+bool     g_ny_close_next_day = false;  // true when NYToServer(InpNYSessionClose) wraps past midnight
+                                       // (server time <= entry time); check is skipped during the
+                                       // current session to prevent IsTimeAfterOrEqual("00:00")
+                                       // from firing permanently on UTC+2 brokers in winter (EST).
 
 //---------------- Persisted daily state ----------------
 double   g_daily_start_balance = 0.0;
@@ -1094,9 +1098,23 @@ void RefreshServerTimes()
    g_svr_hard_close = InpUseHardClose ? SGTToServer(InpHardCloseTimeSGT) : "";
    g_svr_ny_close   = (InpNYSessionClose != "") ? NYToServer(InpNYSessionClose) : "";
 
+   // Detect midnight wrap: if the converted NY-close server time is earlier than or equal to
+   // the entry server time, the close falls on the next calendar day.  Flag it so OnTick()
+   // can skip the check during the current session — this prevents IsTimeAfterOrEqual("00:00")
+   // from firing permanently when UTC offset causes the close time to wrap to midnight.
+   if(g_svr_ny_close != "")
+   {
+      int hh_nyc, mm_nyc, hh_ent, mm_ent;
+      ParseHHMM(g_svr_ny_close, hh_nyc, mm_nyc);
+      ParseHHMM(g_svr_entry,    hh_ent, mm_ent);
+      g_ny_close_next_day = ((hh_nyc * 60 + mm_nyc) <= (hh_ent * 60 + mm_ent));
+   }
+   else
+      g_ny_close_next_day = false;
+
    string zone    = IsNYSummerTime(TimeCurrent()) ? "EDT (UTC-4)" : "EST (UTC-5)";
    string hc_str  = g_svr_hard_close != "" ? g_svr_hard_close : "off";
-   string nyc_str = g_svr_ny_close   != "" ? g_svr_ny_close   : "off";
+   string nyc_str = g_svr_ny_close   != "" ? g_svr_ny_close + (g_ny_close_next_day ? " (next-day)" : "") : "off";
    Print("NY zone: auto (", zone, ")  Monitor: Server ", g_svr_mon_start, "-", g_svr_mon_end,
          "  Entry: ", g_svr_entry, "  Expiry: ", g_svr_expiry,
          "  HardClose(server): ", hc_str,
@@ -1211,7 +1229,7 @@ void OnTick()
       DeleteAllPendings();
 
    // GATE: NY session close — exit positions at end of NY session (DST-aware).
-   if(g_svr_ny_close != "" && IsTimeAfterOrEqual(g_svr_ny_close))
+   if(g_svr_ny_close != "" && !g_ny_close_next_day && IsTimeAfterOrEqual(g_svr_ny_close))
    {
       if(HasActivePosition())
       {
