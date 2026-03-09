@@ -118,7 +118,7 @@ void SaveState()
 
 void LoadState()
 {
-   datetime today = iTime(_Symbol, PERIOD_D1, 0);
+   datetime today = TodayMidnight();
    if(today == 0) return;
 
    datetime stored_day = (datetime)(long)GlobalVariableGet(GVKey_DayKey());
@@ -239,12 +239,24 @@ datetime TodayAt(const string serverHHMM)
    return StructToTime(dt);
 }
 
+// Returns server-time midnight for the current calendar day.
+// Uses TimeCurrent() — unlike iTime(PERIOD_D1, 0) this never returns zero in
+// the MT5 Strategy Tester, preventing g_killswitch / g_orders_placed_today from
+// getting stuck after the first couple of trading days.
+datetime TodayMidnight()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   return StructToTime(dt);
+}
+
 bool IsNewDay()
 {
-   datetime today_key = iTime(_Symbol, PERIOD_D1, 0);
-   if(today_key == 0) return false;
-   if(today_key != g_day_key) { g_day_key = today_key; return true; }
-   return false;
+   datetime today_key = TodayMidnight();
+   if(today_key == g_day_key) return false;
+   g_day_key = today_key;
+   return true;
 }
 
 // targetServerHHMM must already be in server time (use g_svr_* cached strings).
@@ -832,7 +844,7 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   g_day_key = iTime(_Symbol, PERIOD_D1, 0);
+   g_day_key = TodayMidnight();
    LoadState();
 
    return INIT_SUCCEEDED;
