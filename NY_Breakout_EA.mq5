@@ -60,6 +60,7 @@ input double   InpStopLossPips       = 40.0;       // SL distance in pips (1 pip
 input double   InpTakeProfitPips     = 80.0;       // Fixed TP in pips (0 = use range multiplier below)
 input double   InpTPRangeMultiplier  = 2.0;        // TP = range_height × this (when InpTakeProfitPips = 0)
 input double   InpMaxLots            = 5.0;        // Hard lot cap per order (0 = no cap)
+input double   InpMinRangePips       = 15.0;       // Skip day if range height < this (0 = disabled). Tight ranges = fakeout risk.
 
 input bool     InpUseTrailing        = true;
 input double   InpTrailStartPips     = 40.0;       // Profit in pips before trailing starts
@@ -701,12 +702,24 @@ bool PlaceBreakoutOrders()
    // GATE 6: Range
    double hi, lo;
    bool rangeOk = BuildRange(hi, lo);
+   double rangePips = rangeOk ? (hi - lo) / PipSize() : 0.0;
    if(doLog) PrintFormat("[GATE] BUILD_RANGE   ok=%-5s  hi=%.2f  lo=%.2f  height=%.1fpip  → %s",
                          rangeOk ? "true" : "false",
                          (hi > -DBL_MAX) ? hi : 0.0, (lo < DBL_MAX) ? lo : 0.0,
-                         rangeOk ? (hi - lo) / PipSize() : 0.0,
+                         rangePips,
                          rangeOk ? "PASS" : "FAIL(no bars)");
    if(!rangeOk) return false;
+
+   // GATE 6b: Minimum range height — skip days where the range is too compressed.
+   // A tiny range means price barely moved during the monitoring window; breakouts from
+   // such ranges are high-probability fakeouts because there is no directional conviction.
+   if(InpMinRangePips > 0.0 && rangePips < InpMinRangePips)
+   {
+      PrintFormat("SETUP SKIPPED: Range too small (%.1fpip < MinRange %.1fpip). "
+                  "No trade today — tight range = fakeout risk.",
+                  rangePips, InpMinRangePips);
+      return false;
+   }
 
    // Directional bias (informational — gates lot sizes below)
    int bias = GetRangeBias();
@@ -773,12 +786,36 @@ bool PlaceBreakoutOrders()
 
    if(ok1 || ok2)
    {
-      Print("Orders placed. Bias=", (bias > 0 ? "BUY-ONLY" : bias < 0 ? "SELL-ONLY" : "BOTH"),
-            " Range Hi=", hi, " Lo=", lo,
-            " RangeH=", DoubleToString((hi-lo)/pip, 1), "pip  TP=", DoubleToString(tp_pips, 1), "pip",
-            " BuyStop=", buyPrice, " SellStop=", sellPrice,
-            " Expiry(server)=", TimeToString(expiry),
-            " RiskScale=", DoubleToString(g_risk_scale, 2));
+      // ---- Trade setup report (always printed, not just in debug mode) ----
+      // This is your audit trail: every factor that led to the order being placed.
+      string biasTxt = (bias > 0) ? "BULLISH (BuyStop only)" : (bias < 0) ? "BEARISH (SellStop only)" : "NEUTRAL (both sides)";
+
+      Print("━━━ TRADE SETUP REPORT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      PrintFormat("  Time        : %s  (NY %s)", TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES), CurrentNYTime());
+      PrintFormat("  Range window: server %s – %s  (NY %s – %s)",
+                  g_svr_mon_start, g_svr_mon_end, InpMonitoringStart, InpMonitoringEnd);
+      PrintFormat("  Range       : Hi=%.2f  Lo=%.2f  Height=%.1fpip  (MinRange=%.0fpip → %s)",
+                  hi, lo, rangePips,
+                  InpMinRangePips,
+                  InpMinRangePips > 0.0 ? "PASSED" : "filter off");
+      PrintFormat("  Trend filter: %s", InpUseTrendFilter ? ("ON → " + biasTxt) : ("OFF → " + biasTxt));
+      PrintFormat("  News filter : %s  (±%dmin window)",
+                  InpUseNewsFilter ? "ON — cleared" : "OFF", InpNewsMinsBefore);
+      PrintFormat("  Entry type  : %s", InpUsePullbackEntry ? "PULLBACK (market on re-break)" : "STOP ORDERS");
+      if(ok1)
+         PrintFormat("  BUY  stop   : entry=%.2f  SL=%.2f  TP=%.2f  dist=%.1fpip SL / %.1fpip TP  lots=%.2f",
+                     buyPrice, slBuy, tpBuy, InpStopLossPips, tp_pips, lotBuy);
+      if(ok2)
+         PrintFormat("  SELL stop   : entry=%.2f  SL=%.2f  TP=%.2f  dist=%.1fpip SL / %.1fpip TP  lots=%.2f",
+                     sellPrice, slSell, tpSell, InpStopLossPips, tp_pips, lotSell);
+      PrintFormat("  Risk/side   : %.2f%%  RiskScale=%.2f  (base %.2f%% × %.2f)",
+                  MathMin(InpRiskPercent * g_risk_scale, InpRiskPercent * 2.0) * (InpSplitRiskBothSides ? 0.5 : 1.0),
+                  g_risk_scale, InpRiskPercent, g_risk_scale);
+      PrintFormat("  Expiry      : server %s  (%s NY)", TimeToString(expiry, TIME_MINUTES), InpExpirationTime);
+      PrintFormat("  Session W/L : %d/%d today  ConsecLoss=%d (halt at %d)",
+                  g_total_wins_today, g_total_losses_today, g_consec_losses, InpMaxConsecLosses);
+      Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
       g_orders_placed_today = true;
       SaveState();
       return true;
