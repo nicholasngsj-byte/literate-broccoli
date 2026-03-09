@@ -457,13 +457,24 @@ void CloseAllPositions()
 void ResetDailyProtector()
 {
    g_daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   g_killswitch          = false;
    g_orders_placed_today = false;
-   g_consec_losses       = 0;    // consecutive loss counter resets daily
    // g_consec_wins is NOT reset daily — persists until a loss clears it
    g_total_wins_today    = 0;
    g_total_losses_today  = 0;
    g_risk_scale          = 1.0;  // risk scaling resets each day (per spec)
+
+   // g_consec_losses intentionally NOT reset here — it accumulates across trading days so
+   // that InpMaxConsecLosses actually triggers after N straight daily losses instead of
+   // only within a single day.  Clear it by reloading the EA (or deleting GlobalVariables)
+   // once you have reviewed the losing streak.
+
+   // Only clear the killswitch if consecutive losses are below the halt threshold.
+   // If the EA was halted by the consecutive-loss guard it must stay halted until
+   // manually reset, otherwise the protection resets itself every midnight and
+   // allows the balance to bleed indefinitely.
+   if(InpMaxConsecLosses <= 0 || g_consec_losses < InpMaxConsecLosses)
+      g_killswitch = false;
+   // else: keep g_killswitch = true so the EA stays halted until manually reset.
 
    // Pullback state reset (RAM only — no GV needed)
    g_pb_setup_done   = false;

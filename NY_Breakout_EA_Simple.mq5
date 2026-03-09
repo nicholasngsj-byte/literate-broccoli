@@ -393,9 +393,11 @@ void CloseAllPositions()
 void ResetDailyProtector()
 {
    g_daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   g_killswitch          = false;
    g_orders_placed_today = false;
-   g_consec_losses       = 0;   // reset daily — day limit, not permanent halt
+   // g_consec_losses intentionally NOT reset here — accumulates across trading days.
+   // Only clear the killswitch if consecutive losses are below the halt threshold.
+   if(InpMaxConsecLosses <= 0 || g_consec_losses < InpMaxConsecLosses)
+      g_killswitch = false;
    SaveState();
 }
 
