@@ -63,6 +63,7 @@ input double   InpTrailStepPips      = 25.0;       // Trail distance behind curr
 input group "=== PROP FIRM PROTECTION ==="
 input double   InpMaxDailyLossPct    = 3.5;        // Daily loss limit % of start balance (keep < 5% for FTMO)
 input int      InpMaxConsecLosses    = 3;           // Halt after N consecutive losses (0 = disabled)
+input bool     InpResetConsecDaily   = true;        // Reset consecutive loss counter each new day (recommended: true)
 
 input group "=== MARGIN SAFETY ==="
 input bool     InpSplitRiskBothSides = true;        // Split InpRiskPercent between buy + sell
@@ -409,7 +410,8 @@ void ResetDailyProtector()
 {
    g_daily_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_orders_placed_today = false;
-   // g_consec_losses intentionally NOT reset here — accumulates across trading days.
+   if(InpResetConsecDaily)
+      g_consec_losses = 0;
    // Only clear the killswitch if consecutive losses are below the halt threshold.
    if(InpMaxConsecLosses <= 0 || g_consec_losses < InpMaxConsecLosses)
       g_killswitch = false;
