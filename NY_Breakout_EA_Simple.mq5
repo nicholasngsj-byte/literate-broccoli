@@ -53,8 +53,10 @@ input double   InpTakeProfitPips     = 80.0;       // Fixed TP in pips (0 = use 
 input double   InpTPRangeMultiplier  = 2.0;        // TP = range_height × this (when InpTakeProfitPips = 0)
 input double   InpMaxLots            = 5.0;        // Hard lot cap per order (0 = no cap)
 input double   InpMinRangePips       = 15.0;       // Skip day if range height < this (0 = disabled). Tight ranges = fakeout risk.
+input double   InpMaxSpreadPips      = 10.0;       // Skip if spread exceeds this at order time (0 = disabled)
 
 input bool     InpUseTrailing        = true;
+input double   InpBreakevenPips      = 20.0;       // Move SL to entry+1pip when profit reaches this (0 = disabled)
 input double   InpTrailStartPips     = 40.0;       // Profit in pips before trailing starts
 input double   InpTrailStepPips      = 25.0;       // Trail distance behind current price
 
@@ -451,7 +453,7 @@ double NormalizeLot(double lots)
    if(InpMaxLots > 0.0) maxLot = MathMin(maxLot, InpMaxLots);
 
    lots = MathMax(minLot, MathMin(maxLot, lots));
-   lots = MathFloor(lots / step) * step;
+   lots = MathRound(lots / step) * step;
 
    int dp = (step < 0.0099) ? 3 : (step < 0.099) ? 2 : 1;
    return NormalizeDouble(lots, dp);
@@ -480,7 +482,7 @@ double CalcLotByRiskAndMargin(double sl_pips, ENUM_ORDER_TYPE orderType, double 
 
    double lots_risk = NormalizeLot(risk_money / loss_per_lot);
 
-   double freeMargin       = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double freeMargin       = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    double maxMarginAllowed = freeMargin * (InpMaxMarginUsePct / 100.0);
 
    double margin_per_lot = 0.0;
@@ -604,6 +606,19 @@ bool PlaceBreakoutOrders()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
+   // Spread check — wide spreads at NY open erode R:R before the trade even starts.
+   if(InpMaxSpreadPips > 0.0)
+   {
+      double spread_pips = (ask - bid) / pip;
+      if(spread_pips > InpMaxSpreadPips)
+      {
+         if(InpDebugPrint)
+            PrintFormat("SKIP: Spread %.1fpip exceeds max %.1fpip — waiting for spread to tighten.",
+                        spread_pips, InpMaxSpreadPips);
+         return false;
+      }
+   }
+
    if((buyPrice  - ask) < minDist) buyPrice  = ask + minDist;
    if((bid - sellPrice) < minDist) sellPrice = bid - minDist;
 
@@ -706,21 +721,37 @@ void ApplyTrailing()
       if(type == POSITION_TYPE_BUY)
       {
          double profit_pips = (bid - open) / pip;
-         if(profit_pips < InpTrailStartPips) continue;
 
+         // Step 1: Breakeven — move SL to entry+1pip once profit reaches threshold.
+         if(InpBreakevenPips > 0.0 && profit_pips >= InpBreakevenPips && sl < open)
+         {
+            double beSL = NormalizeDouble(open + pip, _Digits);
+            trade.PositionModify(pt, beSL, tp);
+            continue;
+         }
+
+         // Step 2: Trailing stop — activates after InpTrailStartPips profit.
+         if(profit_pips < InpTrailStartPips) continue;
          double newSL = NormalizeDouble(bid - (InpTrailStepPips * pip), _Digits);
          if(sl != 0.0 && newSL <= sl) continue;
-
          trade.PositionModify(pt, newSL, tp);
       }
       else if(type == POSITION_TYPE_SELL)
       {
          double profit_pips = (open - ask) / pip;
-         if(profit_pips < InpTrailStartPips) continue;
 
+         // Step 1: Breakeven — move SL to entry-1pip once profit reaches threshold.
+         if(InpBreakevenPips > 0.0 && profit_pips >= InpBreakevenPips && (sl == 0.0 || sl > open))
+         {
+            double beSL = NormalizeDouble(open - pip, _Digits);
+            trade.PositionModify(pt, beSL, tp);
+            continue;
+         }
+
+         // Step 2: Trailing stop — activates after InpTrailStartPips profit.
+         if(profit_pips < InpTrailStartPips) continue;
          double newSL = NormalizeDouble(ask + (InpTrailStepPips * pip), _Digits);
          if(sl != 0.0 && newSL >= sl) continue;
-
          trade.PositionModify(pt, newSL, tp);
       }
    }
@@ -804,6 +835,12 @@ int OnInit()
 {
    if(!sym.Name(_Symbol)) return INIT_FAILED;
 
+   // Symbol guard — EA pip sizing assumes XAUUSD ($1/pip). Warn if attached elsewhere.
+   string symUpper = _Symbol;
+   StringToUpper(symUpper);
+   if(StringFind(symUpper, "XAU") < 0 && StringFind(symUpper, "GOLD") < 0)
+      Print("WARNING: EA is optimised for XAUUSD. Verify InpStopLossPips is correct for ", _Symbol);
+
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippagePoints);
 
@@ -869,13 +906,17 @@ void OnTick()
    // Fires regardless of killswitch state to guarantee position is flat by the configured time.
    if(g_svr_hard_close != "" && IsTimeAfterOrEqual(g_svr_hard_close))
    {
-      if(HasActivePosition())
+      if(!g_killswitch)
       {
-         Print("HARD CLOSE: SGT cutoff (server ", g_svr_hard_close, ") — force-closing all positions.");
-         CloseAllPositions();
+         if(HasActivePosition())
+         {
+            Print("HARD CLOSE: SGT cutoff (server ", g_svr_hard_close, ") — force-closing all positions.");
+            CloseAllPositions();
+         }
+         if(HasPendingOrders()) DeleteAllPendings();
+         g_killswitch = true;
+         SaveState();
       }
-      if(HasPendingOrders()) DeleteAllPendings();
-      if(!g_killswitch) { g_killswitch = true; SaveState(); }
       return;
    }
 
